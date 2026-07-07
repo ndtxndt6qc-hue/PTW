@@ -364,6 +364,89 @@ const STORAGE_KEY = 'dacheinweisung_forms_v2';
 const MASTER_KEY  = 'ptw_master_v1';
 const SESSION_KEY = 'ptw_session_v1';   // letzter Mode/Permit/Schritt – wird beim Refresh wiederhergestellt
 
+/* Auto-Backup der Stammdaten: rotierende Slots, damit selbst bei einem defekten
+   MASTER_KEY (oder wenn er versehentlich mit leer überschrieben wurde) noch ein
+   funktionierender Snapshot da ist, aus dem der Nutzer wiederherstellen kann. */
+const MASTER_BACKUP_PREFIX = 'ptw_master_backup_';
+const MASTER_BACKUP_SLOTS  = 3;
+function currentMasterCount(){
+  return (app.master.instructors||[]).length +
+         (app.master.properties||[]).length +
+         (app.master.contractors||[]).length;
+}
+function saveMasterBackupSnapshot(){
+  if(currentMasterCount() === 0) return; // nie leere Snapshots anlegen
+  try{
+    // rotierendes 3-Slot-Backup: neuestes in Slot 0, ältere runterschieben
+    for(let i = MASTER_BACKUP_SLOTS-1; i >= 1; i--){
+      const prev = localStorage.getItem(MASTER_BACKUP_PREFIX + (i-1));
+      if(prev) localStorage.setItem(MASTER_BACKUP_PREFIX + i, prev);
+    }
+    localStorage.setItem(MASTER_BACKUP_PREFIX + '0', JSON.stringify({
+      savedAt: new Date().toISOString(),
+      master: app.master,
+    }));
+  }catch(e){ console.warn('Master-Auto-Backup fehlgeschlagen:', e); }
+}
+function listMasterBackups(){
+  const out = [];
+  for(let i = 0; i < MASTER_BACKUP_SLOTS; i++){
+    try{
+      const raw = localStorage.getItem(MASTER_BACKUP_PREFIX + i);
+      if(!raw) continue;
+      const obj = JSON.parse(raw);
+      if(obj && obj.master){
+        const c = (obj.master.instructors||[]).length +
+                  (obj.master.properties||[]).length +
+                  (obj.master.contractors||[]).length;
+        out.push({slot:i, savedAt:obj.savedAt||'', count:c, master:obj.master});
+      }
+    }catch(e){}
+  }
+  return out;
+}
+function installMasterAutoBackup(){
+  // alle 60 Sekunden ein Snapshot, plus einer sofort nach Init
+  try{ saveMasterBackupSnapshot(); }catch(e){}
+  setInterval(()=>{ try{ saveMasterBackupSnapshot(); }catch(e){} }, 60*1000);
+}
+function maybeOfferMasterRestore(){
+  if(currentMasterCount() > 0) return; // Master enthält Daten – nichts zu tun
+  const backups = listMasterBackups().filter(b => b.count > 0);
+  if(backups.length === 0) return; // kein Backup verfügbar
+  // Prompt-Modal
+  setTimeout(()=>{
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,37,71,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:14px;max-width:520px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(15,37,71,.35);font-family:-apple-system,BlinkMacSystemFont,sans-serif;';
+    const newest = backups[0];
+    box.innerHTML =
+      '<h2 style="margin:0 0 8px;color:#0F2547;font-size:20px;">🛟 Stammdaten wiederherstellen?</h2>'+
+      '<p style="margin:0 0 12px;color:#1C1C1C;">Ihre Stammdaten sind aktuell leer. Ein <b>automatisches Backup vom '+
+        new Date(newest.savedAt).toLocaleString('de-CH')+'</b> mit <b>'+newest.count+' Einträgen</b> ist vorhanden.</p>'+
+      '<p style="margin:0 0 12px;color:var(--muted);font-size:13px;">Insgesamt liegen '+backups.length+' Auto-Backup(s) vor.</p>'+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">'+
+        '<button id="mrCancel" class="btn btn-ghost">Nein danke</button>'+
+        '<button id="mrRestore" class="btn btn-primary">Neuestes Backup einspielen</button>'+
+      '</div>';
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    box.querySelector('#mrCancel').addEventListener('click', ()=>overlay.remove());
+    box.querySelector('#mrRestore').addEventListener('click', ()=>{
+      app.master = {
+        instructors: Array.isArray(newest.master.instructors)?newest.master.instructors:[],
+        properties:  Array.isArray(newest.master.properties)?newest.master.properties:[],
+        contractors: Array.isArray(newest.master.contractors)?newest.master.contractors:[],
+      };
+      try{ persistMasterNow(); }catch(e){}
+      overlay.remove();
+      render();
+      alert('Wiederhergestellt: '+newest.count+' Einträge aus dem Auto-Backup vom '+new Date(newest.savedAt).toLocaleString('de-CH')+'.');
+    });
+  }, 500);
+}
+
 // Zeigt an, ob localStorage in der aktuellen Umgebung tatsächlich schreib- und lesbar ist.
 // Wenn nicht (Privater Modus, iOS ITP-Löschung, Cookie-Blocker), setzen wir ein Flag,
 // damit die App eine sichtbare Warnung zeigt und der Nutzer weiss, dass Daten NICHT persistiert werden.
@@ -479,38 +562,62 @@ const app = {
 function newId(prefix){ return prefix+'_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,5); }
 function findById(list, id){ return list.find(x=>x.id===id); }
 function findPropertyByName(name){ return app.master.properties.find(p=>p.address===name); }
+// Signalisiert dem Init, ob der Storage schon einen Master-Eintrag hatte.
+// Wichtig, damit wir bei einem Parse-Fehler NICHT den ursprünglichen Wert
+// mit leerem seedMaster() überschreiben.
+let MASTER_STORAGE_HAD_VALUE = false;
+let MASTER_STORAGE_CORRUPT   = false;
 function loadMaster(){
+  let raw = null;
+  try{ raw = localStorage.getItem(MASTER_KEY); }catch(e){ /* Storage-Fehler; STORAGE_OK ist bereits false */ }
+  if(!raw){ MASTER_STORAGE_HAD_VALUE = false; return seedMaster(); }
+  MASTER_STORAGE_HAD_VALUE = true;
   try{
-    const raw = localStorage.getItem(MASTER_KEY);
-    if(!raw) return seedMaster();
     const m = JSON.parse(raw);
     return {
       instructors: Array.isArray(m.instructors)?m.instructors:[],
       properties:  Array.isArray(m.properties)?m.properties:[],
       contractors: Array.isArray(m.contractors)?m.contractors:[],
     };
-  }catch(e){ return seedMaster(); }
+  }catch(e){
+    // Der Wert ist im Storage, konnte aber nicht geparst werden – niemals mit leerem seedMaster() überschreiben!
+    MASTER_STORAGE_CORRUPT = true;
+    console.error('MASTER_KEY im Storage ist beschädigt – Rohwert wird NICHT ersetzt:', e);
+    return seedMaster();
+  }
 }
 // Roher (sofortiger) Schreibvorgang mit Verifikation. Wird beim Fokus-Verlust,
 // beim Wechsel in den Hintergrund und beim Verlassen der Seite aufgerufen.
 let MASTER_LAST_STAMP = 0;
+// Verify nur beim allerersten Persist. Wenn Storage einmal nachweislich funktioniert,
+// vertrauen wir ihm – Folgeschreibungen prüfen wir nicht mehr (das hatte auf Windows/
+// Corporate-Setups fälschlich einen Warnbanner ausgelöst).
+let MASTER_VERIFIED_ONCE = false;
 function persistMasterNow(){
   try{
     const payload = JSON.stringify(app.master);
     localStorage.setItem(MASTER_KEY, payload);
-    // Verify: sofort wieder lesen, damit wir merken, wenn iOS/Safari den Schreibvorgang stillschweigend verworfen hat.
-    const back = localStorage.getItem(MASTER_KEY);
-    if(back !== payload){
-      console.warn('Stammdaten wurden nicht persistiert (Storage hat den Wert nicht behalten).');
-      if(STORAGE_OK){ STORAGE_OK = false; STORAGE_ERR = 'Stammdaten-Persist verifiziert fehlgeschlagen'; showStorageWarning(); }
-      return false;
+    if(!MASTER_VERIFIED_ONCE){
+      const back = localStorage.getItem(MASTER_KEY);
+      if(back === payload){
+        MASTER_VERIFIED_ONCE = true;
+      } else {
+        // Nur beim allerersten Fehler wirklich alarmieren, weil das ein echter
+        // Storage-Ausfall ist. Kein wiederholter Trigger.
+        console.warn('Stammdaten wurden nicht persistiert (Verify beim ersten Schreiben fehlgeschlagen).');
+        if(STORAGE_OK){ STORAGE_OK = false; STORAGE_ERR = 'Stammdaten-Persist beim Erstversuch fehlgeschlagen'; showStorageWarning(); }
+        return false;
+      }
     }
     MASTER_LAST_STAMP = Date.now();
     updateStorageIndicator();
     return true;
   }catch(e){
+    // Nur bei einer echten Exception loggen; Banner nur beim ersten Mal.
     console.warn('Stammdaten konnten nicht gespeichert werden.', e);
-    if(STORAGE_OK){ STORAGE_OK = false; STORAGE_ERR = (e && e.message)||String(e); showStorageWarning(); }
+    if(STORAGE_OK && !MASTER_VERIFIED_ONCE){
+      STORAGE_OK = false; STORAGE_ERR = (e && e.message)||String(e); showStorageWarning();
+    }
     return false;
   }
 }
@@ -539,15 +646,21 @@ function seedMaster(){
 }
 
 /* ------- Storage (Formulare) ------- */
+let FORMS_STORAGE_HAD_VALUE = false;
+let FORMS_STORAGE_CORRUPT   = false;
 function loadForms(){
+  let raw = null;
+  try{ raw = localStorage.getItem(STORAGE_KEY); }catch(e){ /* Storage-Fehler; STORAGE_OK ist bereits false */ }
+  if(!raw){ FORMS_STORAGE_HAD_VALUE = false; return seedDemoForms(); }
+  FORMS_STORAGE_HAD_VALUE = true;
   try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(!raw) return seedDemoForms();
     const arr = JSON.parse(raw);
     return Array.isArray(arr) ? arr : [];
   }catch(e){
-    console.warn('Storage nicht verfügbar, arbeite nur im Speicher.', e);
-    return seedDemoForms();
+    // Ähnlich wie bei Master: Korruption erkennen und NICHT überschreiben.
+    FORMS_STORAGE_CORRUPT = true;
+    console.error('STORAGE_KEY (Formulare) im Storage ist beschädigt – Rohwert wird NICHT ersetzt:', e);
+    return [];
   }
 }
 function persist(){
@@ -2945,7 +3058,17 @@ try{
   // 2) Daten laden.
   app.forms  = loadForms();
   app.master = loadMaster();
-  try{ persist(); persistMaster(); } catch(e){ /* Health-Check hat bereits informiert */ }
+
+  // 2a) WICHTIG: Beim Init NUR persistieren, wenn im Storage noch nichts stand.
+  //     Vorher wurden bereits gespeicherte Daten mit leerem seedMaster() überschrieben,
+  //     wenn loadMaster() aus irgendeinem Grund leer zurückgab.
+  try{ if(!FORMS_STORAGE_HAD_VALUE) persist(); }catch(e){}
+  try{ if(!MASTER_STORAGE_HAD_VALUE) persistMasterNow(); }catch(e){}
+
+  // 2b) Auto-Backup als Sicherheitsnetz einrichten.
+  installMasterAutoBackup();
+  // Falls Master-Daten mysteriös leer sind, aber ein Auto-Backup existiert: Wiederherstellungs-Dialog anbieten.
+  maybeOfferMasterRestore();
 
   // 3) Sitzungszustand wiederherstellen (Modus, aktueller Permit, Schritt).
   //    Damit springt die App nach einem Refresh nicht mehr aufs Dashboard zurück,
@@ -3001,8 +3124,12 @@ try{
 }
 
 /* Warnbanner, wenn localStorage nicht verfügbar ist (privater Modus, ITP, Blocker). */
+let STORAGE_WARNING_SHOWN = false;
 function showStorageWarning(){
+  if(STORAGE_WARNING_SHOWN) return;
+  STORAGE_WARNING_SHOWN = true;
   const div = document.createElement('div');
+  div.id = 'storageWarnBanner';
   div.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9998;background:#C9382C;color:#fff;padding:12px 18px calc(12px + env(safe-area-inset-bottom,0px)) 18px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;box-shadow:0 -2px 8px rgba(0,0,0,.15);display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
   div.innerHTML =
     '<div style="font-size:20px;">⚠️</div>'+
