@@ -491,9 +491,42 @@ function loadMaster(){
     };
   }catch(e){ return seedMaster(); }
 }
+// Roher (sofortiger) Schreibvorgang mit Verifikation. Wird beim Fokus-Verlust,
+// beim Wechsel in den Hintergrund und beim Verlassen der Seite aufgerufen.
+let MASTER_LAST_STAMP = 0;
+function persistMasterNow(){
+  try{
+    const payload = JSON.stringify(app.master);
+    localStorage.setItem(MASTER_KEY, payload);
+    // Verify: sofort wieder lesen, damit wir merken, wenn iOS/Safari den Schreibvorgang stillschweigend verworfen hat.
+    const back = localStorage.getItem(MASTER_KEY);
+    if(back !== payload){
+      console.warn('Stammdaten wurden nicht persistiert (Storage hat den Wert nicht behalten).');
+      if(STORAGE_OK){ STORAGE_OK = false; STORAGE_ERR = 'Stammdaten-Persist verifiziert fehlgeschlagen'; showStorageWarning(); }
+      return false;
+    }
+    MASTER_LAST_STAMP = Date.now();
+    updateStorageIndicator();
+    return true;
+  }catch(e){
+    console.warn('Stammdaten konnten nicht gespeichert werden.', e);
+    if(STORAGE_OK){ STORAGE_OK = false; STORAGE_ERR = (e && e.message)||String(e); showStorageWarning(); }
+    return false;
+  }
+}
+// Öffentliche persistMaster()-Funktion – debounct schnelle Tastatureingaben, sodass iOS
+// nicht mit vielen Kleinstschreibvorgängen überlastet wird und einige davon still verwirft.
+let _masterPersistTimer = null;
 function persistMaster(){
-  try{ localStorage.setItem(MASTER_KEY, JSON.stringify(app.master)); }
-  catch(e){ console.warn('Stammdaten konnten nicht gespeichert werden.', e); }
+  if(_masterPersistTimer) clearTimeout(_masterPersistTimer);
+  _masterPersistTimer = setTimeout(()=>{ _masterPersistTimer = null; persistMasterNow(); }, 350);
+}
+// Sichtbare kleine Statuszeile für den Nutzer, die zeigt, wann zuletzt gesichert wurde.
+function updateStorageIndicator(){
+  const el = document.getElementById('storageStamp');
+  if(!el) return;
+  const d = MASTER_LAST_STAMP ? new Date(MASTER_LAST_STAMP).toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '–';
+  el.textContent = 'Stammdaten gesichert um '+d;
 }
 function seedMaster(){
   // Auslieferungszustand: keine Beispiel-Stammdaten.
@@ -1098,6 +1131,16 @@ function viewMasterdata(){
   backupActions.appendChild(el('button',{class:'btn btn-secondary',onclick:importMasterBackup,title:'Stammdaten von einem anderen Gerät einspielen'},'📥 Backup importieren'));
   head.appendChild(backupActions);
   wrap.appendChild(head);
+
+  // Sichtbare Speicher-Statuszeile: zeigt Anzahl geladener Stammdaten
+  // und den Zeitpunkt der letzten (verifizierten) Sicherung.
+  const counts = 'Geladen: '+app.master.instructors.length+' Einweiser · '+
+                 app.master.properties.length+' Liegenschaften · '+
+                 app.master.contractors.length+' Auftragnehmer';
+  const stampInit = MASTER_LAST_STAMP ? 'Stammdaten gesichert um '+new Date(MASTER_LAST_STAMP).toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : 'Noch nichts gesichert';
+  const statusRow = el('div',{style:{marginBottom:'14px',padding:'8px 12px',background:'#F4F6FA',border:'1px solid var(--border)',borderRadius:'8px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:'8px',flexWrap:'wrap',fontSize:'12px',color:'var(--muted)'}});
+  statusRow.innerHTML = '<span>💾 '+counts+'</span><span id="storageStamp" style="font-weight:600;color:#2F9E44;">'+stampInit+'</span>';
+  wrap.appendChild(statusRow);
 
   wrap.appendChild(el('div',{class:'banner-info',html:'💡 Hier erfassen Sie wiederkehrende Daten einmalig. In den Formularen erscheinen sie dann als Dropdown und werden mit einem Klick übernommen. Liegenschaftsspezifische Dokumente werden beim Teilen/Mail automatisch angehängt.<br><b>Geräte-Sync:</b> Mit «Backup exportieren» eine JSON-Datei erzeugen, per AirDrop/SharePoint/Mail auf ein anderes Gerät übertragen und dort mit «Backup importieren» einspielen (zusammenführen oder ersetzen).'}));
 
@@ -2925,28 +2968,33 @@ try{
 
   render();
 
-  // 4) Sitzung nach jedem Render sichern (Modus/Permit/Schritt-Wechsel).
-  const _origRender = render;
-  window.render = function(){
-    const r = _origRender.apply(this, arguments);
-    try{ persistSession(); }catch(e){}
-    return r;
-  };
+  // 4) Sitzung regelmässig persistieren (Modus/Permit/Schritt-Wechsel).
+  //    Weil render() als Function-Declaration im geschlossenen Scope liegt,
+  //    setzen wir statt eines Wrappers einen kleinen Watchdog.
+  let _lastSess = '';
+  setInterval(()=>{
+    try{
+      const snap = JSON.stringify({m:app.mode,c:app.currentId,s:app.step,t:app.masterTab,f:app.filter});
+      if(snap !== _lastSess){ _lastSess = snap; persistSession(); }
+    }catch(e){}
+  }, 1500);
   try{ persistSession(); }catch(e){}
 
-  // 5) Auto-Save beim Verlassen der Seite.
+  // 5) Auto-Save beim Verlassen der Seite (Stammdaten IMMER sofort, nicht debounced).
   window.addEventListener('beforeunload', ()=>{
-    try{ persist(); persistMaster(); persistSession(); }catch(e){}
+    try{ persist(); persistMasterNow(); persistSession(); }catch(e){}
   });
   // 6) Auf iOS/Safari beim Wechsel in den Hintergrund persistieren (beforeunload feuert dort oft nicht).
   window.addEventListener('pagehide', ()=>{
-    try{ persist(); persistMaster(); persistSession(); }catch(e){}
+    try{ persist(); persistMasterNow(); persistSession(); }catch(e){}
   });
   document.addEventListener('visibilitychange', ()=>{
     if(document.visibilityState === 'hidden'){
-      try{ persist(); persistMaster(); persistSession(); }catch(e){}
+      try{ persist(); persistMasterNow(); persistSession(); }catch(e){}
     }
   });
+  // 7) Sicherheitsnetz: Alle 5 s einen finalen (verifizierten) Persist auslösen.
+  setInterval(()=>{ try{ if(_masterPersistTimer){ persistMasterNow(); clearTimeout(_masterPersistTimer); _masterPersistTimer = null; } }catch(e){} }, 5000);
 }catch(e){
   fatalError('Der Prototyp konnte nicht gestartet werden.', (e && (e.stack||e.message))||String(e));
   console.error(e);
