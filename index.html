@@ -410,6 +410,181 @@ function installMasterAutoBackup(){
   try{ saveMasterBackupSnapshot(); }catch(e){}
   setInterval(()=>{ try{ saveMasterBackupSnapshot(); }catch(e){} }, 60*1000);
 }
+
+/* Auto-Backup für Formulare – analog zum Master-Auto-Backup. */
+const FORMS_BACKUP_PREFIX = 'ptw_forms_backup_';
+const FORMS_BACKUP_SLOTS  = 3;
+function saveFormsBackupSnapshot(){
+  if(!Array.isArray(app.forms) || app.forms.length === 0) return; // nie leere Snapshots anlegen
+  try{
+    for(let i = FORMS_BACKUP_SLOTS-1; i >= 1; i--){
+      const prev = localStorage.getItem(FORMS_BACKUP_PREFIX + (i-1));
+      if(prev) localStorage.setItem(FORMS_BACKUP_PREFIX + i, prev);
+    }
+    localStorage.setItem(FORMS_BACKUP_PREFIX + '0', JSON.stringify({
+      savedAt: new Date().toISOString(),
+      forms:   app.forms,
+    }));
+  }catch(e){ console.warn('Formular-Auto-Backup fehlgeschlagen:', e); }
+}
+function listFormsBackups(){
+  const out = [];
+  for(let i = 0; i < FORMS_BACKUP_SLOTS; i++){
+    try{
+      const raw = localStorage.getItem(FORMS_BACKUP_PREFIX + i);
+      if(!raw) continue;
+      const obj = JSON.parse(raw);
+      if(obj && Array.isArray(obj.forms)) out.push({slot:i, savedAt:obj.savedAt||'', count:obj.forms.length, forms:obj.forms});
+    }catch(e){}
+  }
+  return out;
+}
+function installFormsAutoBackup(){
+  try{ saveFormsBackupSnapshot(); }catch(e){}
+  setInterval(()=>{ try{ saveFormsBackupSnapshot(); }catch(e){} }, 60*1000);
+}
+/* ------- Storage-Diagnose ---------------------------------------------------
+   Zeigt live an, was im localStorage steht: alle unsere Keys, ihre Größen
+   in Bytes, Zeitstempel und den Browser. Damit lässt sich zielsicher
+   feststellen, ob z. B. auf Windows Chrome/Edge die Werte tatsächlich
+   geschrieben werden – oder ob sie stillschweigend blockiert / verworfen
+   werden (Corporate Policy, Datenschutz-Blocker, Cookie-Reset etc.).       */
+function _fmtBytes(n){
+  if(!n && n!==0) return '–';
+  if(n < 1024) return n+' B';
+  if(n < 1024*1024) return (n/1024).toFixed(1)+' kB';
+  return (n/1024/1024).toFixed(2)+' MB';
+}
+function _readLS(key){
+  try{ return localStorage.getItem(key); }catch(e){ return null; }
+}
+function collectStorageDiagnostics(){
+  const keys = [STORAGE_KEY, MASTER_KEY, SESSION_KEY]
+    .concat([0,1,2].map(i => MASTER_BACKUP_PREFIX+i))
+    .concat([0,1,2].map(i => FORMS_BACKUP_PREFIX+i));
+  const entries = keys.map(k => {
+    const v = _readLS(k);
+    let items = null, savedAt = null;
+    if(v){
+      try{
+        const p = JSON.parse(v);
+        if(Array.isArray(p)) items = p.length + ' Element(e)';
+        else if(p && p.master) items = 'Master · ' + ((p.master.instructors||[]).length+(p.master.properties||[]).length+(p.master.contractors||[]).length) + ' Einträge';
+        else if(p && Array.isArray(p.forms)) items = 'Forms · ' + p.forms.length + ' Permit(s)';
+        else if(p && typeof p === 'object'){ items = Object.keys(p).slice(0,4).join(', '); }
+        if(p && p.savedAt) savedAt = p.savedAt;
+      }catch(e){ items = '⚠ nicht parsebar'; }
+    }
+    return { key:k, size: v ? v.length : 0, items, savedAt };
+  });
+  const totalUsed = entries.reduce((a,e)=>a+e.size, 0);
+  // Kapazitäts-Schätzung: iterativ testen, wie viel wir noch schreiben könnten (bis max 5 MB).
+  let capacityKB = null;
+  try{
+    const testKey = '__ptw_capacity__';
+    let payload = '';
+    const step = 100 * 1024; // 100 kB pro Schritt
+    for(let i = 0; i < 50; i++){
+      const next = payload + 'x'.repeat(step);
+      try{ localStorage.setItem(testKey, next); payload = next; }
+      catch(_){ break; }
+    }
+    capacityKB = Math.round(payload.length / 1024);
+    try{ localStorage.removeItem(testKey); }catch(_){}
+  }catch(e){}
+  return { entries, totalUsed, capacityKB, storageOK:STORAGE_OK, storageErr:STORAGE_ERR, ua:navigator.userAgent };
+}
+function showStorageDiagnostics(){
+  const d = collectStorageDiagnostics();
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,37,71,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:14px;max-width:760px;width:100%;max-height:90vh;overflow-y:auto;padding:22px;box-shadow:0 20px 60px rgba(15,37,71,.35);font-family:-apple-system,BlinkMacSystemFont,sans-serif;';
+  const rows = d.entries.map(e =>
+    '<tr>'+
+      '<td style="padding:6px 8px;font-family:monospace;font-size:12px;color:'+ (e.size?'#0F2547':'#B0B0B0') +';">'+e.key+'</td>'+
+      '<td style="padding:6px 8px;font-size:12px;text-align:right;color:'+ (e.size?'#0F2547':'#B0B0B0') +';">'+_fmtBytes(e.size)+'</td>'+
+      '<td style="padding:6px 8px;font-size:12px;color:'+ (e.size?'#0F2547':'#B0B0B0') +';">'+(e.items||'–')+'</td>'+
+      '<td style="padding:6px 8px;font-size:11px;color:var(--muted);">'+(e.savedAt? new Date(e.savedAt).toLocaleString('de-CH') : '–')+'</td>'+
+    '</tr>'
+  ).join('');
+  box.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;">'+
+      '<h2 style="margin:0;color:#0F2547;font-size:20px;">🔧 Storage-Diagnose</h2>'+
+      '<button id="dgClose" class="btn btn-ghost" style="padding:6px 12px;font-size:18px;">×</button>'+
+    '</div>'+
+    '<p style="margin:0 0 6px;font-size:13px;color:var(--muted);">'+
+      'Status: <b style="color:'+ (d.storageOK?'#2F9E44':'#C9382C') +';">'+ (d.storageOK?'localStorage funktioniert':'⚠ '+d.storageErr) +'</b> · '+
+      'Belegt: <b>'+_fmtBytes(d.totalUsed)+'</b>'+
+      (d.capacityKB!==null? ' · zusätzlich schreibbar: <b>~'+d.capacityKB+' kB</b>' : '')+
+    '</p>'+
+    '<table style="width:100%;border-collapse:collapse;margin-top:10px;background:#F4F6FA;border-radius:8px;overflow:hidden;">'+
+      '<thead><tr style="background:#0F2547;color:#fff;">'+
+        '<th style="padding:8px;text-align:left;font-size:12px;">Key</th>'+
+        '<th style="padding:8px;text-align:right;font-size:12px;">Grösse</th>'+
+        '<th style="padding:8px;text-align:left;font-size:12px;">Inhalt</th>'+
+        '<th style="padding:8px;text-align:left;font-size:12px;">Gespeichert</th>'+
+      '</tr></thead><tbody>'+ rows +'</tbody></table>'+
+    '<details style="margin-top:14px;color:var(--muted);font-size:11px;"><summary>Browser-Info</summary><pre style="white-space:pre-wrap;background:#F4F6FA;padding:8px;border-radius:6px;font-size:11px;">'+
+      d.ua.replace(/</g,'&lt;')+
+    '</pre></details>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:14px;">'+
+      '<button id="dgWriteTest" class="btn btn-secondary">Schreibtest jetzt ausführen</button>'+
+      '<button id="dgCopy" class="btn btn-secondary">Diagnose kopieren</button>'+
+    '</div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  box.querySelector('#dgClose').addEventListener('click', ()=>overlay.remove());
+  box.querySelector('#dgWriteTest').addEventListener('click', ()=>{
+    const testKey = '__ptw_writetest__';
+    const val = 'ping-'+Date.now();
+    let ok = false, err = '';
+    try{
+      localStorage.setItem(testKey, val);
+      const back = localStorage.getItem(testKey);
+      localStorage.removeItem(testKey);
+      ok = (back === val);
+    }catch(e){ err = e.message; }
+    alert(ok ? '✅ Schreibtest OK – localStorage funktioniert in dieser Sitzung.' : '❌ Schreibtest fehlgeschlagen'+(err?': '+err:''));
+  });
+  box.querySelector('#dgCopy').addEventListener('click', async ()=>{
+    const text = JSON.stringify(d, null, 2);
+    try{ await navigator.clipboard.writeText(text); alert('Diagnose in die Zwischenablage kopiert.'); }
+    catch(e){ prompt('Kopieren fehlgeschlagen – bitte manuell markieren:', text.slice(0,4000)); }
+  });
+}
+
+function maybeOfferFormsRestore(){
+  if(Array.isArray(app.forms) && app.forms.length > 0) return;
+  const backups = listFormsBackups().filter(b => b.count > 0);
+  if(backups.length === 0) return;
+  setTimeout(()=>{
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,37,71,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:14px;max-width:520px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(15,37,71,.35);font-family:-apple-system,BlinkMacSystemFont,sans-serif;';
+    const newest = backups[0];
+    box.innerHTML =
+      '<h2 style="margin:0 0 8px;color:#0F2547;font-size:20px;">🛟 Permits wiederherstellen?</h2>'+
+      '<p style="margin:0 0 12px;color:#1C1C1C;">Ihre Formulare sind aktuell leer. Ein <b>automatisches Backup vom '+
+        new Date(newest.savedAt).toLocaleString('de-CH')+'</b> mit <b>'+newest.count+' Permit(s)</b> ist vorhanden.</p>'+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">'+
+        '<button id="frCancel" class="btn btn-ghost">Nein danke</button>'+
+        '<button id="frRestore" class="btn btn-primary">Neuestes Backup einspielen</button>'+
+      '</div>';
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    box.querySelector('#frCancel').addEventListener('click', ()=>overlay.remove());
+    box.querySelector('#frRestore').addEventListener('click', ()=>{
+      app.forms = newest.forms.slice();
+      try{ persist(); }catch(e){}
+      overlay.remove();
+      render();
+      alert('Wiederhergestellt: '+newest.count+' Permit(s) aus dem Auto-Backup vom '+new Date(newest.savedAt).toLocaleString('de-CH')+'.');
+    });
+  }, 500);
+}
 function maybeOfferMasterRestore(){
   if(currentMasterCount() > 0) return; // Master enthält Daten – nichts zu tun
   const backups = listMasterBackups().filter(b => b.count > 0);
@@ -1132,6 +1307,7 @@ function viewDashboard(){
   actions.appendChild(el('button',{class:'btn btn-secondary',onclick:exportAllZip,title:'Alle abgeschlossenen Formulare als ZIP (PDFs + JSON-Backup)'},'📦 Alle exportieren'));
   actions.appendChild(el('button',{class:'btn btn-secondary',onclick:exportFullBackup,title:'Komplettes Backup (Stammdaten + alle Permits) als JSON-Datei – ideal für Geräte-Umzug'},'💾 Komplett-Backup'));
   actions.appendChild(el('button',{class:'btn btn-secondary',onclick:importFullBackup,title:'Komplett-Backup von einem anderen Gerät einspielen'},'📥 Backup einspielen'));
+  actions.appendChild(el('button',{class:'btn btn-ghost',onclick:showStorageDiagnostics,title:'Zeigt an, ob localStorage in diesem Browser tatsächlich funktioniert und was gespeichert ist'},'🔧 Diagnose'));
   actions.appendChild(el('button',{class:'btn btn-primary',onclick:createNewForm},'＋ Neuer Permit to Work'));
   head.appendChild(actions);
   wrap.appendChild(head);
@@ -3065,10 +3241,13 @@ try{
   try{ if(!FORMS_STORAGE_HAD_VALUE) persist(); }catch(e){}
   try{ if(!MASTER_STORAGE_HAD_VALUE) persistMasterNow(); }catch(e){}
 
-  // 2b) Auto-Backup als Sicherheitsnetz einrichten.
+  // 2b) Auto-Backup als Sicherheitsnetz einrichten (Master + Formulare).
   installMasterAutoBackup();
-  // Falls Master-Daten mysteriös leer sind, aber ein Auto-Backup existiert: Wiederherstellungs-Dialog anbieten.
+  installFormsAutoBackup();
+  // Falls Master- oder Formulardaten mysteriös leer sind, aber ein Auto-Backup existiert:
+  //     Wiederherstellungs-Dialog anbieten.
   maybeOfferMasterRestore();
+  maybeOfferFormsRestore();
 
   // 3) Sitzungszustand wiederherstellen (Modus, aktueller Permit, Schritt).
   //    Damit springt die App nach einem Refresh nicht mehr aufs Dashboard zurück,
