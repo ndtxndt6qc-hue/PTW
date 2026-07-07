@@ -362,6 +362,49 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
 const STORAGE_KEY = 'dacheinweisung_forms_v2';
 const MASTER_KEY  = 'ptw_master_v1';
+const SESSION_KEY = 'ptw_session_v1';   // letzter Mode/Permit/Schritt – wird beim Refresh wiederhergestellt
+
+// Zeigt an, ob localStorage in der aktuellen Umgebung tatsächlich schreib- und lesbar ist.
+// Wenn nicht (Privater Modus, iOS ITP-Löschung, Cookie-Blocker), setzen wir ein Flag,
+// damit die App eine sichtbare Warnung zeigt und der Nutzer weiss, dass Daten NICHT persistiert werden.
+let STORAGE_OK = true;
+let STORAGE_ERR = '';
+function storageHealthCheck(){
+  const testKey = '__ptw_probe__';
+  try{
+    localStorage.setItem(testKey, '1');
+    const v = localStorage.getItem(testKey);
+    localStorage.removeItem(testKey);
+    if(v !== '1'){ STORAGE_OK = false; STORAGE_ERR = 'Testwert konnte nicht zurückgelesen werden'; }
+  }catch(e){
+    STORAGE_OK = false;
+    STORAGE_ERR = (e && (e.name+': '+e.message)) || String(e);
+  }
+}
+
+// Sitzung speichern/laden
+function persistSession(){
+  if(!STORAGE_OK) return;
+  try{
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      mode: app.mode,
+      currentId: app.currentId,
+      step: app.step,
+      masterTab: app.masterTab,
+      filter: app.filter,
+      savedAt: new Date().toISOString(),
+    }));
+  }catch(e){ /* schweigend – Health-Check hat bereits gewarnt */ }
+}
+function loadSession(){
+  if(!STORAGE_OK) return null;
+  try{
+    const raw = localStorage.getItem(SESSION_KEY);
+    if(!raw) return null;
+    const s = JSON.parse(raw);
+    return s && typeof s === 'object' ? s : null;
+  }catch(e){ return null; }
+}
 
 const STEPS = [
   { id: 'start',       label: 'Start & Objekt' },
@@ -2852,15 +2895,76 @@ function fatalError(msg, detail){
 }
 
 try{
-  app.forms = loadForms();
+  // 1) Storage-Verfügbarkeit prüfen – Warnbanner einblenden, falls blockiert.
+  storageHealthCheck();
+  if(!STORAGE_OK) showStorageWarning();
+
+  // 2) Daten laden.
+  app.forms  = loadForms();
   app.master = loadMaster();
-  try { persist(); persistMaster(); } catch(e){ /* localStorage kann in Sandbox blockiert sein – Init trotzdem fortsetzen */ }
+  try{ persist(); persistMaster(); } catch(e){ /* Health-Check hat bereits informiert */ }
+
+  // 3) Sitzungszustand wiederherstellen (Modus, aktueller Permit, Schritt).
+  //    Damit springt die App nach einem Refresh nicht mehr aufs Dashboard zurück,
+  //    sondern öffnet den zuletzt bearbeiteten Permit im letzten Schritt.
+  const sess = loadSession();
+  if(sess){
+    if(sess.mode === 'edit' || sess.mode === 'view'){
+      const stillExists = sess.currentId && app.forms.some(f => f.id === sess.currentId);
+      if(stillExists){
+        app.mode      = sess.mode;
+        app.currentId = sess.currentId;
+        app.step      = Math.max(0, Math.min(STEPS.length-1, sess.step|0));
+      }
+    } else if(sess.mode === 'masterdata'){
+      app.mode = 'masterdata';
+      if(sess.masterTab) app.masterTab = sess.masterTab;
+    }
+    if(sess.filter) app.filter = sess.filter;
+  }
+
   render();
-  /* Auto-Save beim Verlassen der Seite */
-  window.addEventListener('beforeunload', ()=>{ try{ persist(); persistMaster(); }catch(e){} });
+
+  // 4) Sitzung nach jedem Render sichern (Modus/Permit/Schritt-Wechsel).
+  const _origRender = render;
+  window.render = function(){
+    const r = _origRender.apply(this, arguments);
+    try{ persistSession(); }catch(e){}
+    return r;
+  };
+  try{ persistSession(); }catch(e){}
+
+  // 5) Auto-Save beim Verlassen der Seite.
+  window.addEventListener('beforeunload', ()=>{
+    try{ persist(); persistMaster(); persistSession(); }catch(e){}
+  });
+  // 6) Auf iOS/Safari beim Wechsel in den Hintergrund persistieren (beforeunload feuert dort oft nicht).
+  window.addEventListener('pagehide', ()=>{
+    try{ persist(); persistMaster(); persistSession(); }catch(e){}
+  });
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState === 'hidden'){
+      try{ persist(); persistMaster(); persistSession(); }catch(e){}
+    }
+  });
 }catch(e){
   fatalError('Der Prototyp konnte nicht gestartet werden.', (e && (e.stack||e.message))||String(e));
   console.error(e);
+}
+
+/* Warnbanner, wenn localStorage nicht verfügbar ist (privater Modus, ITP, Blocker). */
+function showStorageWarning(){
+  const div = document.createElement('div');
+  div.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9998;background:#C9382C;color:#fff;padding:12px 18px calc(12px + env(safe-area-inset-bottom,0px)) 18px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;box-shadow:0 -2px 8px rgba(0,0,0,.15);display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
+  div.innerHTML =
+    '<div style="font-size:20px;">⚠️</div>'+
+    '<div style="flex:1;min-width:220px;">'+
+      '<div style="font-weight:700;">Kein persistenter Speicher verfügbar</div>'+
+      '<div style="opacity:.9;margin-top:2px;">Ihre Eingaben werden <b>nicht dauerhaft</b> gesichert und beim Schliessen des Tabs verworfen. Häufige Ursachen: <b>privater Modus</b>, iOS-Cache-Bereinigung, Cookie-/Storage-Blocker, oder <b>Öffnen als lokale Datei</b>. Öffnen Sie die App über die GitHub-Pages-URL im normalen Browserfenster.</div>'+
+    '</div>'+
+    '<button id="stW_close" style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;">Verstanden</button>';
+  document.body.appendChild(div);
+  document.getElementById('stW_close').addEventListener('click', ()=>{ div.remove(); });
 }
 </script>
 </body>
